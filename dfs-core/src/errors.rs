@@ -10,4 +10,8 @@ pub enum DfsError {
     HashMismatch { expected: String, found: String },
     #[error("invalid file name: {0}")]
     InvalidFileName(String),
+    #[error("file already exists: {0}")]
+    AlreadyExists(String),
+    #[error("the ref.json file has be courrupted")]
+    CourruptedCountFile,
 }

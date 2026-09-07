@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    fs::File,
+    fs::{self, File},
     io::{Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 mod errors;
@@ -12,7 +12,7 @@ use errors::DfsError;
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Map {
     file_name: String,
-    chunk_size: usize, 
+    chunk_size: usize,
     files_names: Vec<String>,
 }
 
@@ -26,24 +26,46 @@ impl Map {
     }
 
     fn create(&self) -> Result<(), DfsError> {
-        let json = serde_json::to_string(self)?;
+        let json = serde_json::to_vec(self)?;
         let path = Path::new(&self.file_name)
             .file_name()
             .ok_or_else(|| DfsError::InvalidFileName(self.file_name.clone()))?;
-        write(
-            format!("./maps/{}.map.json", path.display()),
-            &json.into_bytes(),
-        )?;
+        write(format!("./maps/{}.map.json", path.display()), &json)?;
         Ok(())
     }
 }
 
-pub fn chunk_file(
-    file_name: &str,
-    chunk_size: usize,
-) -> Result<Vec<String>, DfsError> {
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct RefCount {
+    counts: std::collections::HashMap<String, usize>,
+}
+
+impl RefCount {
+    fn get() -> Result<RefCount, DfsError> {
+        let ref_path = PathBuf::from("./maps/refs.json");
+        if !ref_path.exists() {
+            return Ok(RefCount::default());
+        }
+        let content = read("./maps/refs.json".to_owned())?;
+        let refcount: RefCount = serde_json::from_str(&String::from_utf8_lossy(&content))?;
+
+        Ok(refcount)
+    }
+
+    fn save(&self) -> Result<(), DfsError> {
+        let json = serde_json::to_vec(self)?;
+        write("./maps/refs.json".to_string(), &json)?;
+        Ok(())
+    }
+}
+
+pub fn chunk_file(file_name: &str, chunk_size: usize) -> Result<Vec<String>, DfsError> {
     std::fs::create_dir_all("./chunks")?;
     std::fs::create_dir_all("./maps")?;
+    let mut ref_state = RefCount::get()?;
+    if PathBuf::from(format!("./maps/{}.map.json", file_name)).exists() {
+        return Err(DfsError::AlreadyExists(file_name.to_string()));
+    }
     let data = std::fs::read(file_name)?;
     let chunks = data.chunks(chunk_size);
     let mut files_names = Vec::new();
@@ -51,11 +73,13 @@ pub fn chunk_file(
     for chunk in chunks {
         let hex_id = hex::encode(Sha256::digest(chunk));
         write(format!("./chunks/{}", hex_id), chunk)?;
+        *ref_state.counts.entry(hex_id.clone()).or_insert(0) += 1;
         files_names.push(hex_id);
     }
 
     let map = Map::new(file_name.to_string(), chunk_size, files_names.clone());
     map.create()?;
+    ref_state.save()?;
 
     Ok(files_names)
 }
@@ -77,6 +101,25 @@ pub fn reassmble(map_name: &str) -> Result<(), DfsError> {
         reassembled_file.as_slice(),
     )?;
 
+    Ok(())
+}
+
+pub fn purge(file_name: &str) -> Result<(), DfsError> {
+    let content = read(format!("./maps/{}.map.json", file_name))?;
+    let map: Map = serde_json::from_str(&String::from_utf8_lossy(&content))?;
+    let mut ref_state = RefCount::get()?;
+
+    for f in map.files_names {
+        match ref_state.counts.get_mut(&f) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                if *count == 0 {
+                    fs::remove_file(f.clone())?;
+                }
+            }
+            _ => return Err(DfsError::CourruptedCountFile)
+        }
+    }
     Ok(())
 }
 
